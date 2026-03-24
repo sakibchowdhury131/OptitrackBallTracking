@@ -1,28 +1,19 @@
 """
-OptiTrack Ball Tracker — Rolling Window Prediction Mode
-========================================================
-Continuously tracks the ball. Press P to toggle live prediction on/off.
-
-While PREDICTING:
-  - Uses the last N_FIT points to fit a parabola in real time
-  - Draws the fitted curve forward in time (the prediction)
-  - As new points arrive AFTER the fit window, plots them in a different
-    colour so you can see how well the prediction matches reality
-  - The "future error" panel shows 3D distance between predicted and
-    actual positions for every point that arrives after the fit
-
-Controls:
-  P  ->  Toggle rolling prediction on / off
-  R  ->  Reset / clear all prediction data
-  Q  ->  Quit
+OptiTrack Ball Tracker — Fixed-Count Sample Mode + Future Prediction Check
+===========================================================================
+Press P  -> collect exactly N_SAMPLES points, fit a parabola, show result.
+            After fit, the ball keeps being tracked live (green dots) so you
+            can see whether the predicted arc matches reality.
+Press R  -> reset everything, back to live view.
+Press Q  -> quit.
 
 Tune in CONFIG:
-  N_FIT          = 20    # points used for each fit
-  PREDICT_AHEAD_S = 1.0  # how many seconds ahead to draw the prediction arc
+  N_SAMPLES      = 20    # points used for the fit
+  PREDICT_AHEAD_S = 2.0  # how far ahead (s) to draw the prediction arc
   GRAVITY_AXIS   = 1     # 1=Y-up, 2=Z-up (auto-detected)
   TRACKING_MODE  = "rigid_body" or "single_marker"
 
-Requirements: pip install numpy scipy matplotlib
+Requirements:  pip install numpy scipy matplotlib
 """
 
 from __future__ import annotations
@@ -50,53 +41,55 @@ G                = 9.81
 GRAVITY_AXIS     = 1          # 1=Y-up, 2=Z-up. Auto-detected if wrong.
 TRACKING_MODE    = "rigid_body"  # "rigid_body" or "single_marker"
 
-N_FIT            = 20         # ← points used to fit the parabola
-PREDICT_AHEAD_S  = 1.0        # ← how far ahead (seconds) to draw the prediction
-BUFFER_SIZE      = 2000       # total live trail length
-TRAIL_LEN        = 60         # points shown in live trail
-FUTURE_WINDOW    = 200        # max future points to store for error comparison
-PLOT_INTERVAL_MS = 80         # screen refresh ms
+N_SAMPLES        = 20         # points collected for the fit
+PREDICT_AHEAD_S  = 2.0        # seconds beyond fit window to draw prediction arc
+BUFFER_SIZE      = 2000
+TRAIL_LEN        = 80
+PLOT_INTERVAL_MS = 50
 
-# Capture volume limits (metres)
 X_LIM = (-1.5, 1.5)
 Y_LIM = (0.0,  2.5)
 Z_LIM = (-1.5, 1.5)
 
 # ── STATE MACHINE ─────────────────────────────────────────────────────────────
 class Mode:
-    IDLE        = "IDLE"        # live view, no prediction
-    PREDICTING  = "PREDICTING"  # rolling fit + future comparison active
+    IDLE      = "IDLE"       # live view only
+    RECORDING = "RECORDING"  # collecting N_SAMPLES points
+    FITTING   = "FITTING"    # running curve_fit
+    DONE      = "DONE"       # fit shown; future points accumulating
 
 # ── SHARED STATE ──────────────────────────────────────────────────────────────
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
 
-        # live stream — ALL frames go here
-        self.buffer    = deque(maxlen=BUFFER_SIZE)  # (t, xyz)
+        # live stream
+        self.buffer    = deque(maxlen=BUFFER_SIZE)
         self.connected = False
         self.rb_name   = "unknown"
         self.hw_fps    = 0.0
         self._fps_ts   = deque(maxlen=200)
 
-        # mode
-        self.mode      = Mode.IDLE
+        # recorder
+        self.mode           = Mode.IDLE
+        self.arm_time       = None
+        self.record_start_t = None
+        self.record_end_t   = None
+        self.fit_done_t     = None
+        self.samples_t      = []
+        self.samples_p      = []
+        self._target_n      = 0
 
-        # rolling fit — updated by fit thread
-        self.fit_result    = None   # latest fit dict
-        self.fit_window_t  = []     # timestamps of the N_FIT points used
-        self.fit_window_p  = []     # positions  of the N_FIT points used
-        self.fit_locked_at = None   # wall-clock when this fit was computed
+        # results
+        self.fit_result = None
+        self.timing     = None
+        self.accuracy   = None
 
-        # future points: points that arrived AFTER the fit window ended
-        # used to measure how well the prediction holds up
-        self.future_t   = deque(maxlen=FUTURE_WINDOW)  # timestamps
-        self.future_p   = deque(maxlen=FUTURE_WINDOW)  # positions
-        self.future_err = deque(maxlen=FUTURE_WINDOW)  # 3D error vs prediction (mm)
+        # future points: real positions arriving AFTER the fit (for comparison)
+        self.future_p = deque(maxlen=500)
+        self.future_t = deque(maxlen=500)
 
-        # fit thread control
-        self._fit_running = False   # True while a fit is in progress
-        self.plot_dirty   = True
+        self.plot_dirty = True
 
 state = SharedState()
 
@@ -250,8 +243,10 @@ def udp_listener():
             if markers:
                 with state.lock:
                     last = state.buffer[-1][1] if state.buffer else None
-                pos = (min(markers, key=lambda m: np.linalg.norm(m - last))
-                       if last is not None else markers[0]) if len(markers) > 1 else markers[0]
+                if last is not None and len(markers) > 1:
+                    pos = min(markers, key=lambda m: np.linalg.norm(m - last))
+                else:
+                    pos = markers[0]
         else:
             for rb_id, p in parse_rigid_bodies(data):
                 if rb_id_filter is not None and rb_id != rb_id_filter:
@@ -261,6 +256,7 @@ def udp_listener():
         if pos is None:
             continue
 
+        # Always update display buffer + FPS
         with state.lock:
             state.buffer.append((now, pos))
             state.connected  = True
@@ -270,69 +266,101 @@ def udp_listener():
                 span = state._fps_ts[-1] - state._fps_ts[0]
                 if span > 0:
                     state.hw_fps = (len(state._fps_ts) - 1) / span
+            cur_mode = state.mode
+            need     = state._target_n
 
-            cur_mode   = state.mode
-            fit        = state.fit_result
-            locked_at  = state.fit_locked_at
-
-        # ── When PREDICTING: check if this point is AFTER the fit window ──────
-        if cur_mode == Mode.PREDICTING and fit is not None and locked_at is not None:
-            # Points that arrive after the fit window was locked are "future" points
-            if now > locked_at:
-                t_rel     = now - fit['t0_wall']   # time relative to fit t=0
-                pred      = fit['predict'](t_rel)
-                err_mm    = float(np.linalg.norm(pos - pred)) * 1000
-                with state.lock:
-                    state.future_t.append(now)
-                    state.future_p.append(pos.copy())
-                    state.future_err.append(err_mm)
-
-        # ── Trigger a new rolling fit whenever we have N_FIT points ──────────
-        if cur_mode == Mode.PREDICTING:
+        # ── RECORDING: collect exactly N_SAMPLES then trigger fit ─────────────
+        if cur_mode == Mode.RECORDING and need > 0:
             with state.lock:
-                n_buf        = len(state.buffer)
-                fit_running  = state._fit_running
-            if n_buf >= N_FIT and not fit_running:
-                with state.lock:
-                    # Grab the latest N_FIT points
-                    recent = list(state.buffer)[-N_FIT:]
-                    state._fit_running = True
+                if not state.samples_t:
+                    state.record_start_t = now
+                    print(f"[UDP] Collecting {N_SAMPLES} samples...")
+                state.samples_t.append(now)
+                state.samples_p.append(pos.copy())
+                state._target_n -= 1
+                remaining = state._target_n
+                if remaining == 0:
+                    state.record_end_t = now
+                    state.mode         = Mode.FITTING
+                    f_ts  = list(state.samples_t)
+                    f_pts = list(state.samples_p)
+                    t_arm = state.arm_time
+                    t_rec = state.record_start_t
+
+            if remaining == 0:
+                print(f"[UDP] {N_SAMPLES} samples collected. Fitting...")
                 threading.Thread(
-                    target=_run_rolling_fit,
-                    args=(recent,),
+                    target=_run_fit,
+                    args=(f_ts, f_pts, t_arm, t_rec),
                     daemon=True
                 ).start()
 
-# ── ROLLING FIT THREAD ────────────────────────────────────────────────────────
-def _run_rolling_fit(recent: list):
-    """Fit a parabola to the N_FIT most recent points, then unlock."""
-    times  = np.array([r[0] for r in recent])
-    points = np.array([r[1] for r in recent])
+        # ── DONE: accumulate future points for visual comparison ──────────────
+        elif cur_mode == Mode.DONE:
+            with state.lock:
+                state.future_p.append(pos.copy())
+                state.future_t.append(now)
 
-    fit = fit_parabola(times, points)
+# ── FIT THREAD ────────────────────────────────────────────────────────────────
+def _run_fit(f_ts, f_pts, t_arm, t_rec_start):
+    fit     = fit_parabola(np.array(f_ts), np.array(f_pts))
+    fit_end = time.time()
+
+    if not fit:
+        print("[Fit] Fit failed.")
+        with state.lock: state.mode = Mode.IDLE
+        return
+
+    t_land = predict_landing(fit)
+    g_axis = fit['gravity_axis']
+
+    timing = {
+        "arm_to_first_sample_s" : round(t_rec_start - t_arm,  3) if t_arm else None,
+        "collection_duration_s" : round(fit['duration_s'],     3),
+        "fit_compute_s"         : round(fit_end - (t_rec_start + fit['duration_s']), 3),
+        "total_arm_to_fit_s"    : round(fit_end - t_arm,       3) if t_arm else None,
+        "n_samples"             : fit['n_points'],
+        "sample_rate_hz"        : round(fit['sample_rate'],    1),
+        "hw_fps"                : round(state.hw_fps,          1),
+    }
+    accuracy = {
+        "rms_3d_mm"   : round(fit['rms_3d_mm'],       2),
+        "mean_err_mm" : round(fit['mean_err_mm'],      2),
+        "max_err_mm"  : round(fit['max_err_mm'],       2),
+        "res_x_mm"    : round(fit['residuals_mm'][0],  2),
+        "res_y_mm"    : round(fit['residuals_mm'][1],  2),
+        "res_z_mm"    : round(fit['residuals_mm'][2],  2),
+        "speed_mps"   : round(fit['speed'],            3),
+        "speed_kmh"   : round(fit['speed'] * 3.6,      2),
+        "gravity_axis": g_axis,
+    }
+    if fit['t_apex']:
+        ap = fit['predict'](fit['t_apex'])
+        accuracy['apex_height_m'] = round(float(ap[g_axis]), 3)
+        accuracy['apex_time_s']   = round(fit['t_apex'],     3)
+    if t_land:
+        lp    = fit['predict'](t_land)
+        non_g = [i for i in range(3) if i != g_axis]
+        dist  = float(np.sqrt(sum((lp[i]-[fit['x0'],fit['y0'],fit['z0']][i])**2 for i in non_g)))
+        accuracy['landing_pos'] = tuple(round(float(lp[i]), 3) for i in range(3))
+        accuracy['range_m']     = round(dist, 3)
 
     with state.lock:
-        if fit:
-            state.fit_result    = fit
-            state.fit_window_t  = list(times)
-            state.fit_window_p  = list(points)
-            state.fit_locked_at = times[-1]   # wall-clock of last fit point
-            # Clear future buffer — new fit means old future points are stale
-            state.future_t.clear()
-            state.future_p.clear()
-            state.future_err.clear()
-        state._fit_running  = False
-        state.plot_dirty    = True
+        state.fit_result = fit
+        state.timing     = timing
+        state.accuracy   = accuracy
+        state.fit_done_t = fit_end
+        state.mode       = Mode.DONE   # ← switches to DONE once, never loops
+        state.plot_dirty = True
+
+    _print_report(timing, accuracy)
 
 # ── PARABOLA FIT ──────────────────────────────────────────────────────────────
 def fit_parabola(times: np.ndarray, points: np.ndarray) -> Optional[dict]:
     if len(times) < 3:
         return None
 
-    t_wall0 = float(times[0])
-    t = times - t_wall0   # relative time starting at 0
-
-    # Auto-detect gravity axis
+    t = times - times[0]
     curvatures = [abs(np.polyfit(t, points[:, ax], 2)[0]) for ax in range(3)]
     detected   = int(np.argmax(curvatures))
     used_axis  = GRAVITY_AXIS
@@ -340,6 +368,9 @@ def fit_parabola(times: np.ndarray, points: np.ndarray) -> Optional[dict]:
         ratio = curvatures[detected] / max(curvatures[GRAVITY_AXIS], 1e-9)
         if ratio > 2.0:
             used_axis = detected
+            print(f"[Fit] Auto-override: axis {GRAVITY_AXIS} -> {detected} "
+                  f"(curvatures X={curvatures[0]:.3f} Y={curvatures[1]:.3f} "
+                  f"Z={curvatures[2]:.3f}). Set GRAVITY_AXIS={detected} to silence.")
 
     acc = [0.0, 0.0, 0.0]
     acc[used_axis] = -G
@@ -354,7 +385,7 @@ def fit_parabola(times: np.ndarray, points: np.ndarray) -> Optional[dict]:
 
         try:
             v_init  = (p_obs[-1] - p_obs[0]) / (t[-1] + 1e-9)
-            popt, _ = curve_fit(model, t, p_obs, p0=[p_obs[0], v_init], maxfev=2000)
+            popt, _ = curve_fit(model, t, p_obs, p0=[p_obs[0], v_init], maxfev=3000)
         except Exception:
             c    = np.polyfit(t, p_obs - 0.5 * a_fixed * t**2, 1)
             popt = [c[1], c[0]]
@@ -364,9 +395,8 @@ def fit_parabola(times: np.ndarray, points: np.ndarray) -> Optional[dict]:
     (x0, vx), (y0, vy), (z0, vz) = fitted
     _acc = acc
 
-    def predict(t_rel):
-        """t_rel = seconds since t_wall0 (first point in fit window)."""
-        tq = np.atleast_1d(np.array(t_rel, dtype=float))
+    def predict(t_query):
+        tq = np.atleast_1d(np.array(t_query, dtype=float))
         return np.stack([
             x0 + vx*tq + 0.5*_acc[0]*tq**2,
             y0 + vy*tq + 0.5*_acc[1]*tq**2,
@@ -375,7 +405,6 @@ def fit_parabola(times: np.ndarray, points: np.ndarray) -> Optional[dict]:
 
     v_up   = [vx, vy, vz][used_axis]
     t_apex = v_up / G if v_up > 0 else None
-
     pred_pts   = predict(t)
     per_pt_err = np.linalg.norm(points - pred_pts, axis=1) * 1000
 
@@ -384,13 +413,15 @@ def fit_parabola(times: np.ndarray, points: np.ndarray) -> Optional[dict]:
         speed        = float(np.sqrt(vx**2 + vy**2 + vz**2)),
         residuals_mm = [r * 1000 for r in residuals],
         per_pt_err   = per_pt_err,
-        rms_3d_mm    = float(np.sqrt(np.mean(per_pt_err**2))),
+        max_err_mm   = float(np.max(per_pt_err)),
         mean_err_mm  = float(np.mean(per_pt_err)),
+        rms_3d_mm    = float(np.sqrt(np.mean(per_pt_err**2))),
         n_points     = len(times),
         duration_s   = float(t[-1]),
+        sample_rate  = float(len(times) / (t[-1] + 1e-9)),
         t_apex       = t_apex,
         predict      = predict,
-        t0_wall      = t_wall0,      # absolute wall-clock of first fit point
+        t0           = float(times[0]),   # wall-clock of first sample
         gravity_axis = used_axis,
     )
 
@@ -406,16 +437,65 @@ def predict_landing(fit: dict, floor_height=0.0) -> Optional[float]:
     cands = [t for t in [t1, t2] if t > 0]
     return min(cands) if cands else None
 
+# ── PRINT REPORT ──────────────────────────────────────────────────────────────
+def _print_report(timing, accuracy):
+    print(f"\n{'='*58}")
+    print(f"  TRAJECTORY REPORT  ({timing['n_samples']} samples)")
+    print(f"{'─'*58}")
+    print(f"  {'P press -> 1st sample':<32}: {timing['arm_to_first_sample_s']} s")
+    print(f"  {'Collection window':<32}: {timing['collection_duration_s']} s")
+    print(f"  {'Fit compute time':<32}: {timing['fit_compute_s']} s")
+    print(f"  {'Total (P -> result)':<32}: {timing['total_arm_to_fit_s']} s")
+    print(f"  {'Sample rate':<32}: {timing['sample_rate_hz']} Hz  "
+          f"(Motive: {timing['hw_fps']} Hz)")
+    print(f"{'─'*58}")
+    print(f"  {'3D RMS error':<32}: {accuracy['rms_3d_mm']} mm")
+    print(f"  {'Mean / Max error':<32}: {accuracy['mean_err_mm']} / {accuracy['max_err_mm']} mm")
+    print(f"  {'Residuals X / Y / Z':<32}: "
+          f"{accuracy['res_x_mm']} / {accuracy['res_y_mm']} / {accuracy['res_z_mm']} mm")
+    print(f"  {'Gravity axis':<32}: {'XYZ'[accuracy['gravity_axis']]} "
+          f"(axis {accuracy['gravity_axis']})")
+    print(f"{'─'*58}")
+    print(f"  {'Launch speed':<32}: {accuracy['speed_mps']} m/s  ({accuracy['speed_kmh']} km/h)")
+    if 'apex_height_m' in accuracy:
+        print(f"  {'Apex height':<32}: {accuracy['apex_height_m']} m  "
+              f"at t={accuracy['apex_time_s']} s")
+    if 'range_m' in accuracy:
+        lp = accuracy['landing_pos']
+        print(f"  {'Predicted landing':<32}: {lp} m")
+        print(f"  {'Horizontal range':<32}: {accuracy['range_m']} m")
+    print(f"{'='*58}\n")
+    print("  [Ball is still being tracked — green dots show actual future positions]")
+    print("  [Press R to reset, P for a new capture]\n")
+
+# ── ANIMATION RESUME WATCHDOG ─────────────────────────────────────────────────
+def _wait_and_resume(ani_ref):
+    while True:
+        time.sleep(0.05)
+        with state.lock:
+            m = state.mode
+        if m in (Mode.DONE, Mode.IDLE):
+            time.sleep(0.1)
+            try:
+                if ani_ref[0] is not None:
+                    ani_ref[0].resume()
+                    print("[Viz] Animation RESUMED.")
+            except Exception:
+                pass
+            return
+
 # ── LIVE PLOT ─────────────────────────────────────────────────────────────────
 MODE_COLORS = {
-    Mode.IDLE:       ("#888888", "IDLE  --  Press P to start prediction"),
-    Mode.PREDICTING: ("#00ffaa", "● PREDICTING  --  P to stop  |  R to reset"),
+    Mode.IDLE:      ("#888888", "IDLE  --  Press P to collect & fit"),
+    Mode.RECORDING: ("#ff4400", "● RECORDING"),
+    Mode.FITTING:   ("#00aaff", "⚙ Fitting..."),
+    Mode.DONE:      ("#44ff88", "✔ Done  --  green = actual future  |  P new capture  |  R reset"),
 }
 
 def start_live_plot():
     fig = plt.figure(figsize=(16, 8), facecolor='#0a0a0a')
     try:
-        fig.canvas.manager.set_window_title("OptiTrack Ball Tracker — Rolling Prediction")
+        fig.canvas.manager.set_window_title("OptiTrack Ball Tracker")
     except Exception:
         pass
 
@@ -424,11 +504,10 @@ def start_live_plot():
                            wspace=0.38, hspace=0.48)
 
     ax3d = fig.add_subplot(gs[:, 0], projection='3d', facecolor='#0a0a0a')
-    ax_h = fig.add_subplot(gs[0, 1], facecolor='#0a0a0a')   # height vs time
-    ax_e = fig.add_subplot(gs[1, 1], facecolor='#0a0a0a')   # future error
-    ax_r = fig.add_subplot(gs[:, 2], facecolor='#0a0a0a')   # report
+    ax_h = fig.add_subplot(gs[0, 1], facecolor='#0a0a0a')
+    ax_e = fig.add_subplot(gs[1, 1], facecolor='#0a0a0a')
+    ax_r = fig.add_subplot(gs[:, 2], facecolor='#0a0a0a')
 
-    # 3D static styling
     for pane in [ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane]:
         pane.fill = False; pane.set_edgecolor('#2a2a2a')
     ax3d.tick_params(colors='#666', labelsize=7)
@@ -447,39 +526,40 @@ def start_live_plot():
         ax.set_ylabel(ylabel, color='#888', fontsize=8)
         ax.grid(True, color='#1a1a1a', linestyle='--', linewidth=0.6)
 
-    _style(ax_h, 'Height vs Time  (orange=fit window, green=future actual, blue=prediction)',
+    _style(ax_h, 'Height vs Time  [orange=fit pts | blue=prediction | green=actual future]',
            'Time (s)', 'Height (m)')
-    _style(ax_e, f'Prediction Error (future points vs parabola)',
-           'Future point index', 'Error (mm)')
-    ax_h.set_xlim(-0.1, PREDICT_AHEAD_S * 1.5)
-    ax_h.set_ylim(*Y_LIM)
+    _style(ax_e, 'Per-Point 3-D Error (fit window)', 'Point index', 'Error (mm)')
+    ax_h.set_xlim(-0.05, 0.5); ax_h.set_ylim(*Y_LIM)
     ax_r.axis('off')
-    ax_r.set_title('Live Stats', color='#ccc', fontsize=9, pad=4)
+    ax_r.set_title('Analysis Report', color='#ccc', fontsize=9, pad=4)
 
-    # ── Persistent 3D artists ─────────────────────────────────────────────────
-    trail_sc   = ax3d.scatter([], [], [], s=14, alpha=0.4, cmap='cool',   label='Trail')
-    cur_sc     = ax3d.scatter([], [], [], c='#ff3333', s=80,  zorder=6,   label='Current')
-    window_sc  = ax3d.scatter([], [], [], c='#ff8800', s=40,  zorder=5,   label=f'Fit window ({N_FIT} pts)')
-    future_sc  = ax3d.scatter([], [], [], c='#00ff88', s=40,  zorder=5,   label='Future actual')
-    pred_ln,   = ax3d.plot([], [], [], color='#00aaff', lw=2, alpha=0.9,  label='Prediction')
-    apex_sc    = ax3d.scatter([], [], [], c='gold',    s=140, marker='^', zorder=7, label='Apex')
-    land_sc    = ax3d.scatter([], [], [], c='#ff44ff', s=140, marker='*', zorder=7, label='Landing')
+    # Persistent artists
+    trail_sc  = ax3d.scatter([], [], [], s=16, alpha=0.40, cmap='cool',  label='Trail')
+    cur_sc    = ax3d.scatter([], [], [], c='#ff3333', s=80, zorder=6,    label='Current')
+    samp_sc   = ax3d.scatter([], [], [], c='#ff8800', s=50, zorder=5,    label=f'Fit pts ({N_SAMPLES})')
+    future_sc = ax3d.scatter([], [], [], c='#00ff88', s=30, zorder=4,    label='Future actual')
+    fit_ln,   = ax3d.plot([], [], [], color='#00aaff', lw=2,             label='Prediction')
+    apex_sc   = ax3d.scatter([], [], [], c='gold',   s=160, marker='^',  zorder=7, label='Apex')
+    land_sc   = ax3d.scatter([], [], [], c='#ff44ff',s=160, marker='*',  zorder=7, label='Landing')
     ax3d.legend(fontsize=6, loc='upper left',
                 facecolor='#111', edgecolor='#333', labelcolor='#bbb')
 
-    # ── Persistent height plot artists ────────────────────────────────────────
-    win_ln,  = ax_h.plot([], [], 'o', color='#ff8800', ms=5,  label=f'Fit window ({N_FIT} pts)', zorder=5)
-    fut_ln,  = ax_h.plot([], [], 's', color='#00ff88', ms=5,  label='Future actual',             zorder=5)
-    pred_h,  = ax_h.plot([], [], color='#00aaff', lw=2,       label='Prediction',                zorder=4)
+    obs_ln,  = ax_h.plot([], [], 'o', color='#ff8800', ms=5, label=f'Fit pts ({N_SAMPLES})')
+    fut_ln,  = ax_h.plot([], [], 's', color='#00ff88', ms=4, label='Future actual')
+    fit_h,   = ax_h.plot([], [], color='#00aaff', lw=2,      label='Prediction')
     apex_vl  = ax_h.axvline(0, color='gold',    lw=1, ls='--', alpha=0, label='Apex')
     land_vl  = ax_h.axvline(0, color='#ff44ff', lw=1, ls='--', alpha=0, label='Landing')
     ax_h.legend(fontsize=7, facecolor='#111', edgecolor='#333', labelcolor='#bbb')
 
+    prog_txt   = ax3d.text2D(0.02, 0.02, '', transform=ax3d.transAxes,
+                             color='#ffdd00', fontsize=10, fontfamily='monospace')
     report_txt = ax_r.text(0.04, 0.97, '', transform=ax_r.transAxes,
-                           color='#cccccc', fontsize=9,
+                           color='#cccccc', fontsize=8.5,
                            verticalalignment='top', fontfamily='monospace')
     status_bar = fig.text(0.5, 0.95, '', ha='center', va='top',
-                          fontsize=12, fontweight='bold')
+                          fontsize=11, fontweight='bold')
+
+    ani_ref = [None]
 
     # ── Key handler ───────────────────────────────────────────────────────────
     def on_key(event):
@@ -487,27 +567,39 @@ def start_live_plot():
         if key == 'p':
             with state.lock:
                 m = state.mode
-            if m == Mode.IDLE:
+            if m in (Mode.IDLE, Mode.DONE):
                 with state.lock:
-                    state.mode = Mode.PREDICTING
-                    state.fit_result    = None
-                    state.future_t.clear()
+                    state.mode           = Mode.RECORDING
+                    state.arm_time       = time.time()
+                    state.record_start_t = None
+                    state.record_end_t   = None
+                    state.fit_done_t     = None
+                    state.samples_t      = []
+                    state.samples_p      = []
+                    state._target_n      = N_SAMPLES
+                    state.fit_result     = None
+                    state.timing         = None
+                    state.accuracy       = None
                     state.future_p.clear()
-                    state.future_err.clear()
-                print(f"[Key] PREDICTING — rolling {N_FIT}-point fit active.")
-            else:
-                with state.lock:
-                    state.mode = Mode.IDLE
-                print("[Key] Prediction OFF.")
+                    state.future_t.clear()
+                if ani_ref[0] is not None:
+                    ani_ref[0].pause()
+                    print(f"[Key] Animation PAUSED. Collecting {N_SAMPLES} samples...")
+                threading.Thread(target=_wait_and_resume, args=(ani_ref,), daemon=True).start()
         elif key == 'r':
             with state.lock:
-                state.mode = Mode.IDLE
-                state.fit_result    = None
-                state.fit_window_t  = []
-                state.fit_window_p  = []
-                state.future_t.clear()
+                state.mode       = Mode.IDLE
+                state.fit_result = None
+                state.timing     = None
+                state.accuracy   = None
+                state.samples_t  = []
+                state.samples_p  = []
+                state._target_n  = 0
                 state.future_p.clear()
-                state.future_err.clear()
+                state.future_t.clear()
+            if ani_ref[0] is not None:
+                try: ani_ref[0].resume()
+                except Exception: pass
             print("[Key] Reset.")
         elif key == 'q':
             plt.close('all')
@@ -524,17 +616,19 @@ def start_live_plot():
             return
 
         with state.lock:
-            buf       = list(state.buffer)
-            mode      = state.mode
-            fit       = state.fit_result
-            win_t     = list(state.fit_window_t)
-            win_p     = list(state.fit_window_p)
-            fut_t     = list(state.future_t)
-            fut_p     = list(state.future_p)
-            fut_err   = list(state.future_err)
-            rb        = state.rb_name
-            conn      = state.connected
-            hw_fps    = state.hw_fps
+            buf      = list(state.buffer)
+            mode     = state.mode
+            fit      = state.fit_result
+            s_pts    = list(state.samples_p)
+            s_ts     = list(state.samples_t)
+            n_so_far = len(s_pts)
+            fut_p    = list(state.future_p)
+            fut_t    = list(state.future_t)
+            timing   = state.timing
+            accuracy = state.accuracy
+            rb       = state.rb_name
+            conn     = state.connected
+            hw_fps   = state.hw_fps
 
         # Status bar
         color, label = MODE_COLORS[mode]
@@ -544,7 +638,7 @@ def start_live_plot():
         status_bar.set_text(f"{label}{rb_str}")
         status_bar.set_color(color)
 
-        # Live trail
+        # Live trail (always shown)
         if buf:
             trail = np.array([b[1] for b in buf[-TRAIL_LEN:]])
             n     = len(trail)
@@ -555,159 +649,153 @@ def start_live_plot():
         else:
             trail_sc._offsets3d = cur_sc._offsets3d = ([], [], [])
 
+        # Recording progress
+        prog_txt.set_text(f"{n_so_far}/{N_SAMPLES}" if mode == Mode.RECORDING else '')
+
         g_ax = fit['gravity_axis'] if fit else GRAVITY_AXIS
 
         # Fit window points (orange)
-        if win_p:
-            wp  = np.array(win_p)
-            wt  = np.array(win_t) - win_t[0]
-            window_sc._offsets3d = (wp[:, 0], wp[:, 2], wp[:, 1])
-            win_ln.set_data(wt, wp[:, g_ax])
+        if s_pts:
+            sp = np.array(s_pts)
+            st = np.array(s_ts) - s_ts[0]
+            samp_sc._offsets3d = (sp[:, 0], sp[:, 2], sp[:, 1])
+            obs_ln.set_data(st, sp[:, g_ax])
+            if len(st) > 1:
+                ax_h.set_xlim(-0.02, max(st[-1] * 1.3 + 0.05,
+                                         fit['duration_s'] + PREDICT_AHEAD_S + 0.1 if fit else 0.5))
         else:
-            window_sc._offsets3d = ([], [], [])
-            win_ln.set_data([], [])
+            samp_sc._offsets3d = ([], [], [])
+            obs_ln.set_data([], [])
 
-        # Future actual points (green)
-        if fut_p:
-            fp  = np.array(fut_p)
-            # time relative to fit t=0
-            ft  = np.array(fut_t) - fit['t0_wall'] if fit else np.zeros(len(fut_t))
-            future_sc._offsets3d = (fp[:, 0], fp[:, 2], fp[:, 1])
-            fut_ln.set_data(ft, fp[:, g_ax])
-        else:
-            future_sc._offsets3d = ([], [], [])
-            fut_ln.set_data([], [])
-
-        # Prediction arc (blue)
+        # Prediction arc (blue) — drawn from t=0 to duration + PREDICT_AHEAD_S
         if fit:
-            t_fit_dur = fit['duration_s']
-            # Draw from t=0 to t = fit_duration + PREDICT_AHEAD_S
-            t_end   = t_fit_dur + PREDICT_AHEAD_S
+            t_end   = fit['duration_s'] + PREDICT_AHEAD_S
             t_range = np.linspace(0, t_end, 400)
             pred    = fit['predict'](t_range)
-            pred_ln.set_data_3d(pred[:, 0], pred[:, 2], pred[:, 1])
-            pred_h.set_data(t_range, pred[:, g_ax])
+            fit_ln.set_data_3d(pred[:, 0], pred[:, 2], pred[:, 1])
+            fit_h.set_data(t_range, pred[:, g_ax])
+            ax_h.set_xlim(-0.02, t_end * 1.1)
 
-            # Auto-scale height plot to show fit window + prediction
-            total_t = max(t_end, ft[-1] if fut_t else 0) if fut_t else t_end
-            ax_h.set_xlim(-0.05, total_t * 1.1)
-
-            # Apex marker
             if fit['t_apex'] and 0 < fit['t_apex'] < t_end:
                 ap = fit['predict'](fit['t_apex'])
                 apex_sc._offsets3d = ([ap[0]], [ap[2]], [ap[1]])
-                apex_vl.set_xdata([fit['t_apex']] * 2); apex_vl.set_alpha(0.8)
+                apex_vl.set_xdata([fit['t_apex']] * 2); apex_vl.set_alpha(0.85)
             else:
                 apex_sc._offsets3d = ([], [], []); apex_vl.set_alpha(0)
 
-            # Landing marker
             t_land = predict_landing(fit)
-            if t_land and 0 < t_land < t_end + 1.0:
+            if t_land and 0 < t_land < t_end + 0.5:
                 lp = fit['predict'](t_land)
                 land_sc._offsets3d = ([lp[0]], [lp[2]], [lp[1]])
-                land_vl.set_xdata([t_land] * 2); land_vl.set_alpha(0.8)
+                land_vl.set_xdata([t_land] * 2); land_vl.set_alpha(0.85)
             else:
                 land_sc._offsets3d = ([], [], []); land_vl.set_alpha(0)
 
-            # Future error bar chart
-            ax_e.cla()
-            _style(ax_e, f'Prediction Error — future pts vs parabola',
-                   'Future point index', 'Error (mm)')
-            if fut_err:
-                errs = np.array(fut_err)
-                norm = errs / max(errs.max(), 1e-9)
-                ax_e.bar(range(len(errs)), errs,
-                         color=plt.cm.RdYlGn_r(norm), alpha=0.85, width=0.8)
-                mean_e = float(np.mean(errs))
-                ax_e.axhline(mean_e, color='#ffdd00', lw=1.2, ls='--',
-                             label=f'mean {mean_e:.1f} mm')
-                ax_e.legend(fontsize=7, facecolor='#111',
-                             edgecolor='#333', labelcolor='#bbb')
-
-            # Report panel
-            g_label = f"{'XYZ'[fit['gravity_axis']]} (axis {fit['gravity_axis']})"
-            n_fut   = len(fut_err)
-            mean_fut_err = float(np.mean(fut_err)) if fut_err else None
-            max_fut_err  = float(np.max(fut_err))  if fut_err else None
-
-            lines = [
-                f"FIT WINDOW : {N_FIT} pts",
-                f"PREDICT    : +{PREDICT_AHEAD_S} s ahead",
-                f"Gravity ax : {g_label}",
-                "",
-                "FIT QUALITY (window)",
-                f"  RMS err  : {fit['rms_3d_mm']:.2f} mm",
-                f"  Mean err : {fit['mean_err_mm']:.2f} mm",
-                f"  Speed    : {fit['speed']:.3f} m/s",
-                f"           : {fit['speed']*3.6:.2f} km/h",
-            ]
-            if fit['t_apex']:
-                ap = fit['predict'](fit['t_apex'])
-                lines += [f"  Apex ht  : {ap[g_ax]:.3f} m @ {fit['t_apex']:.3f} s"]
-            if t_land:
-                lines += [f"  Landing  : t={t_land:.3f} s"]
-            lines += [""]
-            if n_fut > 0:
-                lines += [
-                    f"PREDICTION ACCURACY",
-                    f"  Future pts     : {n_fut}",
-                    f"  Mean fut. err  : {mean_fut_err:.2f} mm",
-                    f"  Max fut. err   : {max_fut_err:.2f} mm",
-                ]
-                # Quality judgement
-                if mean_fut_err < 10:
-                    lines += ["  Quality : ✓ EXCELLENT (<10 mm)"]
-                elif mean_fut_err < 30:
-                    lines += ["  Quality : ~ GOOD (<30 mm)"]
-                elif mean_fut_err < 100:
-                    lines += ["  Quality : ! FAIR (<100 mm)"]
-                else:
-                    lines += ["  Quality : ✗ POOR (>100 mm)"]
+            # Future actual points (green) — time relative to fit t=0
+            if fut_p:
+                fp  = np.array(fut_p)
+                ft  = np.array(fut_t) - fit['t0']
+                future_sc._offsets3d = (fp[:, 0], fp[:, 2], fp[:, 1])
+                fut_ln.set_data(ft, fp[:, g_ax])
+                # Expand x-axis as future points arrive
+                if len(ft) > 0:
+                    ax_h.set_xlim(-0.02, max(t_end * 1.1, ft[-1] * 1.1 + 0.05))
             else:
-                lines += ["PREDICTION ACCURACY",
-                          "  Waiting for future",
-                          "  points to arrive..."]
+                future_sc._offsets3d = ([], [], [])
+                fut_ln.set_data([], [])
 
-            report_txt.set_text('\n'.join(lines))
-
+            # Per-point error bars (fit window only)
+            ax_e.cla()
+            _style(ax_e, 'Per-Point 3-D Error (fit window)', 'Point index', 'Error (mm)')
+            errs = fit['per_pt_err']
+            norm = errs / max(errs.max(), 1e-9)
+            ax_e.bar(range(len(errs)), errs,
+                     color=plt.cm.RdYlGn_r(norm), alpha=0.85, width=0.8)
+            ax_e.axhline(fit['mean_err_mm'], color='#ffdd00', lw=1.2, ls='--',
+                         label=f"mean {fit['mean_err_mm']:.1f} mm")
+            ax_e.axhline(fit['rms_3d_mm'],   color='#00aaff', lw=1.0, ls=':',
+                         label=f"RMS  {fit['rms_3d_mm']:.1f} mm")
+            ax_e.legend(fontsize=7, facecolor='#111', edgecolor='#333', labelcolor='#bbb')
+            for i, e in enumerate(errs):
+                ax_e.text(i, e + errs.max()*0.02, str(i),
+                          ha='center', va='bottom', color='#888', fontsize=6)
         else:
-            pred_ln.set_data_3d([], [], [])
-            pred_h.set_data([], [])
+            fit_ln.set_data_3d([], [], [])
+            fit_h.set_data([], [])
+            future_sc._offsets3d = ([], [], [])
+            fut_ln.set_data([], [])
             apex_sc._offsets3d = land_sc._offsets3d = ([], [], [])
             apex_vl.set_alpha(0); land_vl.set_alpha(0)
 
-            if mode == Mode.PREDICTING:
-                report_txt.set_text(
-                    f"PREDICTING\n\n"
-                    f"Waiting for\n{N_FIT} points...\n\n"
-                    f"Move the ball!"
-                )
-            else:
-                report_txt.set_text(
-                    f"N_FIT = {N_FIT} pts\n"
-                    f"PREDICT = +{PREDICT_AHEAD_S} s\n\n"
-                    f"P  -  start prediction\n"
-                    f"R  -  reset\n"
-                    f"Q  -  quit\n\n"
-                    f"Press P then\nmove the ball."
-                )
+        # Report panel
+        if timing and accuracy:
+            g_label  = f"{'XYZ'[accuracy['gravity_axis']]} (axis {accuracy['gravity_axis']})"
+            n_future = len(fut_p)
+            lines = [
+                f"N_SAMPLES = {timing['n_samples']}",
+                f"PREDICT   = +{PREDICT_AHEAD_S} s",
+                "",
+                "TIMING",
+                f"  P -> 1st sample : {timing['arm_to_first_sample_s']} s",
+                f"  Collection      : {timing['collection_duration_s']} s",
+                f"  Fit compute     : {timing['fit_compute_s']} s",
+                f"  Total           : {timing['total_arm_to_fit_s']} s",
+                f"  Sample rate     : {timing['sample_rate_hz']} Hz",
+                f"  Motive stream   : {timing['hw_fps']} Hz",
+                "",
+                "FIT ACCURACY",
+                f"  3D RMS          : {accuracy['rms_3d_mm']} mm",
+                f"  Mean / Max      : {accuracy['mean_err_mm']} / {accuracy['max_err_mm']} mm",
+                f"  Res X/Y/Z       : {accuracy['res_x_mm']} / "
+                                    f"{accuracy['res_y_mm']} / {accuracy['res_z_mm']} mm",
+                f"  Gravity axis    : {g_label}",
+                "",
+                "KINEMATICS",
+                f"  Speed           : {accuracy['speed_mps']} m/s",
+                f"                  : {accuracy['speed_kmh']} km/h",
+            ]
+            if 'apex_height_m' in accuracy:
+                lines += [f"  Apex height     : {accuracy['apex_height_m']} m",
+                          f"  Apex time       : {accuracy['apex_time_s']} s"]
+            if 'range_m' in accuracy:
+                lp = accuracy['landing_pos']
+                lines += [f"  Landing         : {lp} m",
+                          f"  Range           : {accuracy['range_m']} m"]
+            lines += ["",
+                      f"FUTURE PTS (green): {n_future}",
+                      "  (accumulating live...)"]
+            report_txt.set_text('\n'.join(lines))
 
-    ani = animation.FuncAnimation(fig, update, interval=PLOT_INTERVAL_MS,
-                                  blit=False, cache_frame_data=False)
+        elif mode == Mode.RECORDING:
+            report_txt.set_text(
+                f"RECORDING\n\n{n_so_far} / {N_SAMPLES}\n\nMove the ball now!")
+        elif mode == Mode.FITTING:
+            report_txt.set_text("Fitting parabola...")
+        else:
+            report_txt.set_text(
+                f"N_SAMPLES = {N_SAMPLES}\n"
+                f"PREDICT = +{PREDICT_AHEAD_S} s\n\n"
+                f"P  -  collect & fit\n"
+                f"R  -  reset\n"
+                f"Q  -  quit\n\n"
+                f"Press P then move\nthe ball.")
+
+    ani_ref[0] = animation.FuncAnimation(fig, update, interval=PLOT_INTERVAL_MS,
+                                         blit=False, cache_frame_data=False)
     plt.show()
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 60)
-    print("  OptiTrack Ball Tracker — Rolling Window Prediction")
-    print("=" * 60)
+    print("=" * 58)
+    print("  OptiTrack Ball Tracker — Fixed Fit + Future Comparison")
+    print("=" * 58)
     print(f"  Motive server  : {SERVER_IP}")
-    print(f"  N_FIT          : {N_FIT}  (points used per fit)")
+    print(f"  N_SAMPLES      : {N_SAMPLES}")
     print(f"  PREDICT_AHEAD  : {PREDICT_AHEAD_S} s")
     print(f"  TRACKING_MODE  : {TRACKING_MODE}")
-    print(f"  GRAVITY_AXIS   : {GRAVITY_AXIS} ({'XYZ'[GRAVITY_AXIS]}-up, auto-corrected)")
+    print(f"  GRAVITY_AXIS   : {GRAVITY_AXIS} ({'XYZ'[GRAVITY_AXIS]}-up)")
     print()
-    print("  P  ->  Toggle rolling prediction on / off")
+    print("  P  ->  Collect N_SAMPLES points, fit, then track future")
     print("  R  ->  Reset")
     print("  Q  ->  Quit")
     print()
